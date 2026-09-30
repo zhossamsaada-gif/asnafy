@@ -2217,8 +2217,8 @@ async function switchScannerCamera(){
 async function loadZXingBrowser(){
   if(window.ZXingBrowser) return true;
   const urls=[
-    'https://unpkg.com/@zxing/browser@0.1.5/umd/index.min.js',
-    'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js'
+    'https://unpkg.com/@zxing/browser@0.1.5/umd/zxing-browser.min.js',
+    'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/zxing-browser.min.js'
   ];
   for(const src of urls){
     try{
