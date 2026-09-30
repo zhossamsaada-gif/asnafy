@@ -2169,7 +2169,7 @@ async function startScanner(){
   try{
     const box=document.getElementById('scannerVideo');
     scannerEngine=new Html5Qrcode('scannerVideo',{formatsToSupport:[Html5QrcodeSupportedFormats.EAN_13,Html5QrcodeSupportedFormats.EAN_8,Html5QrcodeSupportedFormats.UPC_A,Html5QrcodeSupportedFormats.UPC_E,Html5QrcodeSupportedFormats.UPC_EAN_EXTENSION,Html5QrcodeSupportedFormats.CODE_128,Html5QrcodeSupportedFormats.CODE_39,Html5QrcodeSupportedFormats.CODE_93,Html5QrcodeSupportedFormats.CODABAR,Html5QrcodeSupportedFormats.ITF],verbose:false});
-    await scannerEngine.start({facingMode:scannerFacing,width:{ideal:1920},height:{ideal:1080}},{fps:10,disableFlip:false},(decodedText)=>{
+    await scannerEngine.start({facingMode:scannerFacing},{fps:10,disableFlip:false,aspectRatio:1.5,videoConstraints:{facingMode:scannerFacing,width:{ideal:1280},height:{ideal:720}}},(decodedText)=>{
       const raw=String(decodedText||'').trim();
       if(!/^\d{6,18}$/.test(raw)){scannerLastRaw='';scannerStableHits=0;return;}
       if(raw===scannerLastRaw)scannerStableHits++;else{scannerLastRaw=raw;scannerStableHits=1;}
