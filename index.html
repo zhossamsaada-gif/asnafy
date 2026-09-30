@@ -496,7 +496,6 @@ body{
   #quality .qtile .qlabel{font-size:10px!important}
 }
 /* The safe-area/header remains blue; content area stays light under the tiles. */
-.scanner-status{font-weight:800;min-height:24px}
 </style>
 
 </head>
@@ -581,7 +580,6 @@ body{
 <div id="list"></div>
 </div>
 
-<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script>
 const ALAMANA_SUPABASE_URL='https://ngwuxqufaahpqhrdmwjn.supabase.co';
 const ALAMANA_SUPABASE_KEY='sb_publishable_wh9FVvSNrYYcMsE3znhTPw_18YF9Jwc';
@@ -822,18 +820,11 @@ async function pollCloudChanges(){
   }
   cloudPollBusy=true;
   try{
-    if(!cloudPollStarted && !cloudLastSeenAt){
-      const r=await cloudFetch('/rest/v1/products?select=updated_at&order=updated_at.desc&limit=1',{method:'GET'});
-      if(!r.ok)throw new Error('HTTP '+r.status+'\n'+(await r.text()));
-      const rows=await r.json();
-      cloudLastSeenAt=maxCloudTimestamp(rows)||new Date().toISOString();
-      localStorage.setItem('alamana_cloud_last_seen_at',cloudLastSeenAt);
-      cloudPollStarted=true;
-      return;
-    }
-
+    // أول مزامنة على جهاز جديد: نزّل حالة Cloud الحالية مرة واحدة فقط، ثم احفظ آخر وقت.
+    // المزامنات التالية تستخدم updated_at فقط، لذلك لا تعيد تنزيل كل الأصناف كل مرة.
     cloudPollStarted=true;
-    const since=cloudLastSeenAt||new Date(0).toISOString();
+    const firstCloudSync=!cloudLastSeenAt;
+    const since=cloudLastSeenAt || new Date(0).toISOString();
     const pageSize=500;
     let offset=0;
     let allChanged=[];
@@ -2153,51 +2144,216 @@ document.getElementById('q').addEventListener('input',()=>{
 render();
 
 renderQuality();
-let scannerEngine=null, scannerTarget=null, scannerFacing='environment', scannerLastRaw='', scannerStableHits=0, scannerStarting=false;
-function scannerSetStatus(t){const e=document.getElementById('scannerStatus');if(e)e.textContent=t;}
-async function openScanner(id,j){scannerTarget={type:'variant',id,j};await startScanner();}
-async function openNewScanner(id){scannerTarget={type:'new',id};await startScanner();}
-async function openSearchScanner(){scannerTarget={type:'search'};await startScanner();}
-async function startScanner(){
-  if(scannerStarting)return;
-  if(!window.Html5Qrcode){alert('تعذر تحميل قارئ الباركود. تأكد من اتصال الإنترنت ثم أعد فتح الصفحة.');return;}
-  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){alert('الكاميرا تحتاج إلى فتح الصفحة عبر HTTPS واستخدام متصفح يدعم الكاميرا.');return;}
-  scannerStarting=true;
-  const overlay=document.getElementById('scannerOverlay');
-  overlay.style.display='flex';scannerSetStatus('جاري تشغيل الكاميرا…');
-  scannerLastRaw='';scannerStableHits=0;
-  try{
-    const box=document.getElementById('scannerVideo');
-    scannerEngine=new Html5Qrcode('scannerVideo',{formatsToSupport:[Html5QrcodeSupportedFormats.EAN_13,Html5QrcodeSupportedFormats.EAN_8,Html5QrcodeSupportedFormats.UPC_A,Html5QrcodeSupportedFormats.UPC_E,Html5QrcodeSupportedFormats.UPC_EAN_EXTENSION,Html5QrcodeSupportedFormats.CODE_128,Html5QrcodeSupportedFormats.CODE_39,Html5QrcodeSupportedFormats.CODE_93,Html5QrcodeSupportedFormats.CODABAR,Html5QrcodeSupportedFormats.ITF],verbose:false});
-    await scannerEngine.start({facingMode:scannerFacing},{fps:10,disableFlip:false,aspectRatio:1.5,videoConstraints:{facingMode:scannerFacing,width:{ideal:1280},height:{ideal:720}}},(decodedText)=>{
-      const raw=String(decodedText||'').trim();
-      if(!/^\d{6,18}$/.test(raw)){scannerLastRaw='';scannerStableHits=0;return;}
-      if(raw===scannerLastRaw)scannerStableHits++;else{scannerLastRaw=raw;scannerStableHits=1;}
-      scannerSetStatus('تمت قراءة: '+raw);
-      if(scannerStableHits>=2){putScannedBarcode(raw);closeScanner();}
-    },()=>{});
-    const video=box.querySelector('video');if(video){video.setAttribute('playsinline','');video.muted=true;}
-    scannerSetStatus('وجّه الباركود داخل الإطار…');
-  }catch(e){console.error('Scanner start failed:',e);await closeScanner();alert('تعذر تشغيل الكاميرا. اسمح لـ Safari باستخدام الكاميرا وتأكد من فتح الصفحة عبر HTTPS.');}
-  finally{scannerStarting=false;}
+let scannerStream=null, scannerTimer=null, scannerTarget=null, scannerFacing='environment';
+
+function scannerSetStatus(t){ const e=document.getElementById('scannerStatus'); if(e)e.textContent=t; }
+
+async function openScanner(id,j){
+  scannerTarget={type:'variant',id,j};
+  await startScanner();
 }
+async function openNewScanner(id){
+  scannerTarget={type:'new',id};
+  await startScanner();
+}
+async function openSearchScanner(){
+  scannerTarget={type:'search'};
+  await startScanner();
+}
+
+async function switchScannerCamera(){
+  if(!scannerStream){
+    return;
+  }
+  try{
+    const devices=await navigator.mediaDevices.enumerateDevices();
+    const cams=devices.filter(d=>d.kind==='videoinput');
+    if(cams.length<2){
+      scannerSetStatus('لا توجد كاميرات أخرى متاحة على الجهاز.');
+      return;
+    }
+
+    const currentTrack=scannerStream.getVideoTracks()[0];
+    const currentId=currentTrack?.getSettings?.().deviceId || '';
+    const idx=Math.max(0,cams.findIndex(d=>d.deviceId===currentId));
+    const next=cams[(idx+1)%cams.length];
+
+    if(!next || !next.deviceId){
+      scannerSetStatus('تعذر تبديل الكاميرا.');
+      return;
+    }
+
+    currentTrack.stop();
+
+    scannerStream=await navigator.mediaDevices.getUserMedia({
+      video:{
+        deviceId:{exact:next.deviceId},
+        width:{ideal:1920},
+        height:{ideal:1080},
+        resizeMode:'none'
+      }
+    });
+
+    const track=scannerStream.getVideoTracks()[0];
+    const caps=track.getCapabilities ? track.getCapabilities() : {};
+    if(caps.zoom && typeof caps.zoom.min==='number'){
+      try{ await track.applyConstraints({advanced:[{zoom:caps.zoom.min}]}); }catch(e){}
+    }
+
+    const label=track.label || next.label || 'كاميرا';
+    scannerSetStatus('الكاميرا الحالية: '+label);
+
+    const video=document.querySelector('#scannerVideo');
+    if(video){
+      video.srcObject=scannerStream;
+      await video.play().catch(()=>{});
+    }
+  }catch(e){
+    console.error('Camera switch failed:',e);
+    scannerSetStatus('تعذر تبديل الكاميرا.');
+  }
+}
+
+async function loadZXingBrowser(){
+  if(window.ZXingBrowser) return true;
+  const urls=[
+    'https://unpkg.com/@zxing/browser@0.1.5/umd/index.min.js',
+    'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js'
+  ];
+  for(const src of urls){
+    try{
+      await new Promise((resolve,reject)=>{
+        const sc=document.createElement('script'); sc.src=src; sc.async=true;
+        sc.onload=resolve; sc.onerror=reject; document.head.appendChild(sc);
+      });
+      if(window.ZXingBrowser) return true;
+    }catch(e){}
+  }
+  return false;
+}
+
+async function startScanner(){
+  if(!('mediaDevices' in navigator) || !navigator.mediaDevices.getUserMedia){
+    alert('الكاميرا غير متاحة في هذا المتصفح. افتح البرنامج عبر HTTPS واسمح للمتصفح باستخدام الكاميرا.');
+    return;
+  }
+  try{
+    document.getElementById('scannerOverlay').style.display='flex';
+    scannerSetStatus('جاري تشغيل الكاميرا…');
+    scannerStream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}}
+    });
+
+    try{
+      const devices=await navigator.mediaDevices.enumerateDevices();
+      const cams=devices.filter(d=>d.kind==='videoinput');
+      const bad=/(tele|telephoto|zoom|macro|ultra.?wide|wide.?angle|depth|3x|5x|10x|2x)/i;
+      const front=/(front|user|facetime)/i;
+      const rear=cams.filter(d=>!front.test(d.label||''));
+      const preferred=rear.find(d=>d.label && /back|rear|main|camera\s*0/i.test(d.label) && !bad.test(d.label)) || rear.find(d=>d.label && !bad.test(d.label)) || rear[0];
+      const current=scannerStream.getVideoTracks()[0];
+      const currentLabel=current?.label||'';
+      if(preferred?.deviceId && bad.test(currentLabel)){
+        current.stop();
+        scannerStream=await navigator.mediaDevices.getUserMedia({video:{deviceId:{exact:preferred.deviceId},width:{ideal:1920},height:{ideal:1080}}});
+      }
+      const track=scannerStream.getVideoTracks()[0];
+      const caps=track.getCapabilities ? track.getCapabilities() : {};
+      if(caps.zoom && typeof caps.zoom.min==='number'){
+        try{await track.applyConstraints({advanced:[{zoom:caps.zoom.min}]});}catch(e){}
+      }
+    }catch(e){ console.warn('Camera selection fallback:',e); }
+
+    const video=document.getElementById('scannerVideo');
+    video.srcObject=scannerStream;
+    await video.play();
+    scannerSetStatus('وجّه الباركود داخل الإطار…');
+    clearInterval(scannerTimer);
+
+    // استخدم BarcodeDetector عندما يكون متاحًا، وإلا استخدم ZXing المتوافق مع Safari/iOS.
+    if('BarcodeDetector' in window){
+      const supported=await BarcodeDetector.getSupportedFormats();
+      const wanted=['ean_13','ean_8','upc_a','upc_e','code_128','code_39','itf'];
+      const formats=wanted.filter(x=>supported.includes(x));
+      if(!formats.length) throw new Error('NO_BARCODE_FORMATS');
+      const detector=new BarcodeDetector({formats});
+      let lastRaw='',hits=0;
+      scannerTimer=setInterval(async()=>{
+        if(!scannerStream || video.readyState<2)return;
+        try{
+          const codes=await detector.detect(video);
+          const raw=String(codes?.[0]?.rawValue??'').trim();
+          if(!raw)return;
+          if(raw===lastRaw)hits++;else{lastRaw=raw;hits=1;}
+          scannerSetStatus('تمت قراءة: '+raw);
+          if(hits>=2){putScannedBarcode(raw);closeScanner();}
+        }catch(e){}
+      },180);
+      return;
+    }
+
+    const loaded=await loadZXingBrowser();
+    if(!loaded) throw new Error('ZXING_LOAD_FAILED');
+    const Reader=window.ZXingBrowser.BrowserMultiFormatReader;
+    if(!Reader) throw new Error('ZXING_UNAVAILABLE');
+    const reader=new Reader();
+    scannerSetStatus('جاري التعرف على الباركود…');
+    let finished=false;
+    reader.decodeFromVideoElement(video,(result,err)=>{
+      if(finished || !result)return;
+      const raw=String(result.getText?.()??result.text??'').trim();
+      if(!raw)return;
+      finished=true;
+      scannerSetStatus('تمت قراءة: '+raw);
+      putScannedBarcode(raw);
+      try{reader.reset();}catch(e){}
+      closeScanner();
+    });
+    scannerTimer={zxingReader:reader};
+  }catch(e){
+    console.error('Scanner failed:',e);
+    closeScanner();
+    alert('تعذر قراءة الباركود. تأكد من السماح للمتصفح بالكاميرا وأن الصفحة تعمل عبر HTTPS.');
+  }
+}
+
 function putScannedBarcode(value){
   if(!scannerTarget)return;
-  const raw=String(value??'').trim();if(!/^\d{6,18}$/.test(raw))return;
   const t=scannerTarget;
-  if(t.type==='search'){const q=document.getElementById('q');if(q){q.value=raw;render();}return;}
-  if(t.type==='variant'){const p=products.find(x=>x.id===t.id);if(p&&p.variants&&p.variants[t.j]){p.variants[t.j].barcode=raw;save(true,true);render();}}
-  else{const el=document.getElementById('vb-'+cssSafe(t.id));if(el){el.value=raw;el.dispatchEvent(new Event('input',{bubbles:true}));}}
+  if(t.type==='search'){
+    const q=document.getElementById('q');
+    if(q){q.value=value; render();}
+    return;
+  }
+  if(t.type==='variant'){
+    const p=products.find(x=>x.id===t.id);
+    if(p && p.variants && p.variants[t.j]){
+      p.variants[t.j].barcode=value;
+      save(true,true); render();
+    }
+  }else{
+    const el=document.getElementById('vb-'+cssSafe(t.id));
+    if(el){el.value=value;}
+  }
 }
-async function closeScanner(){
-  const engine=scannerEngine;scannerEngine=null;
-  if(engine){try{if(engine.isScanning)await engine.stop();}catch(e){}try{engine.clear();}catch(e){}}
-  const box=document.getElementById('scannerVideo');if(box)box.innerHTML='';
-  const overlay=document.getElementById('scannerOverlay');if(overlay)overlay.style.display='none';
-  scannerTarget=null;scannerLastRaw='';scannerStableHits=0;
+function closeScanner(){
+  if(scannerTimer && typeof scannerTimer==='object' && scannerTimer.zxingReader){try{scannerTimer.zxingReader.reset();}catch(e){}}
+  else clearInterval(scannerTimer);
+  scannerTimer=null;
+  if(scannerStream){scannerStream.getTracks().forEach(t=>t.stop());scannerStream=null;}
+  const v=document.getElementById('scannerVideo'); if(v)v.srcObject=null;
+  const o=document.getElementById('scannerOverlay'); if(o)o.style.display='none';
+  scannerTarget=null;
 }
-async function switchScannerCamera(){scannerFacing=scannerFacing==='environment'?'user':'environment';const target=scannerTarget;if(scannerEngine)await closeScanner();scannerTarget=target;await startScanner();}
-async function switchCamera(){await switchScannerCamera();}
+async function switchCamera(){
+  scannerFacing=(scannerFacing==='environment')?'user':'environment';
+  if(scannerStream){
+    const target=scannerTarget;
+    closeScanner();
+    scannerTarget=target;
+    await startScanner();
+  }
+}
 window.addEventListener('pagehide',closeScanner);
 
 </script>
@@ -2207,7 +2363,7 @@ window.addEventListener('pagehide',closeScanner);
     <h3>📷 تصوير الباركود</h3>
     <div class="scanner-status" id="scannerStatus">اسمح للمتصفح باستخدام الكاميرا ثم وجّه الباركود داخل الإطار.</div>
     <div style="position:relative">
-      <div id="scannerVideo" class="scanner-video"></div>
+      <video id="scannerVideo" class="scanner-video" autoplay muted playsinline></video>
       <div class="scan-frame"></div>
     </div>
     <div class="scanner-actions" style="margin-top:12px">
