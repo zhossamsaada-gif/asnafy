@@ -2233,87 +2233,180 @@ async function loadZXingBrowser(){
 }
 
 async function startScanner(){
-  if(!('mediaDevices' in navigator) || !navigator.mediaDevices.getUserMedia){
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
     alert('الكاميرا غير متاحة في هذا المتصفح. افتح البرنامج عبر HTTPS واسمح للمتصفح باستخدام الكاميرا.');
     return;
   }
+
+  let reader=null;
+  let usingZXing=false;
+
+  const stopReader=()=>{
+    try{ if(reader && typeof reader.reset==='function') reader.reset(); }catch(e){}
+    reader=null;
+    usingZXing=false;
+  };
+
+  const startZXing=async(video)=>{
+    stopReader();
+    const loaded=await loadZXingBrowser();
+    if(!loaded || !window.ZXingBrowser || !window.ZXingBrowser.BrowserMultiFormatReader){
+      throw new Error('ZXING_LOAD_FAILED');
+    }
+
+    const Reader=window.ZXingBrowser.BrowserMultiFormatReader;
+    reader=new Reader();
+    usingZXing=true;
+    scannerSetStatus('جاري التعرف على الباركود…');
+
+    await new Promise((resolve)=>{
+      let done=false;
+      const finish=(raw)=>{
+        if(done || !raw)return;
+        done=true;
+        scannerSetStatus('تمت قراءة: '+raw);
+        putScannedBarcode(raw);
+        stopReader();
+        closeScanner();
+        resolve(true);
+      };
+
+      try{
+        reader.decodeFromVideoElement(video,(result,err)=>{
+          if(done)return;
+          if(result){
+            const raw=String(
+              typeof result.getText==='function' ? result.getText() :
+              (result.text ?? result.rawValue ?? '')
+            ).trim();
+            if(raw) finish(raw);
+          }
+        });
+      }catch(e){
+        console.error('ZXing start failed:',e);
+        resolve(false);
+      }
+    });
+  };
+
   try{
     document.getElementById('scannerOverlay').style.display='flex';
     scannerSetStatus('جاري تشغيل الكاميرا…');
+
+    // iOS Safari يعمل بشكل أفضل مع facingMode ثم اختيار الكاميرا الخلفية إذا أمكن.
     scannerStream=await navigator.mediaDevices.getUserMedia({
-      video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}}
+      audio:false,
+      video:{
+        facingMode:{ideal:'environment'},
+        width:{ideal:1920,min:640},
+        height:{ideal:1080,min:480}
+      }
     });
 
     try{
       const devices=await navigator.mediaDevices.enumerateDevices();
       const cams=devices.filter(d=>d.kind==='videoinput');
-      const bad=/(tele|telephoto|zoom|macro|ultra.?wide|wide.?angle|depth|3x|5x|10x|2x)/i;
       const front=/(front|user|facetime)/i;
+      const bad=/(tele|telephoto|zoom|macro|ultra.?wide|wide.?angle|depth|3x|5x|10x|2x)/i;
       const rear=cams.filter(d=>!front.test(d.label||''));
-      const preferred=rear.find(d=>d.label && /back|rear|main|camera\s*0/i.test(d.label) && !bad.test(d.label)) || rear.find(d=>d.label && !bad.test(d.label)) || rear[0];
+      const preferred=
+        rear.find(d=>d.label && /back|rear|main|camera\s*0/i.test(d.label) && !bad.test(d.label)) ||
+        rear.find(d=>d.label && !bad.test(d.label)) ||
+        rear[0];
+
       const current=scannerStream.getVideoTracks()[0];
       const currentLabel=current?.label||'';
+
       if(preferred?.deviceId && bad.test(currentLabel)){
         current.stop();
-        scannerStream=await navigator.mediaDevices.getUserMedia({video:{deviceId:{exact:preferred.deviceId},width:{ideal:1920},height:{ideal:1080}}});
+        scannerStream=await navigator.mediaDevices.getUserMedia({
+          audio:false,
+          video:{
+            deviceId:{exact:preferred.deviceId},
+            width:{ideal:1920,min:640},
+            height:{ideal:1080,min:480}
+          }
+        });
       }
+
       const track=scannerStream.getVideoTracks()[0];
       const caps=track.getCapabilities ? track.getCapabilities() : {};
+      if(caps.focusMode && Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')){
+        try{await track.applyConstraints({advanced:[{focusMode:'continuous'}]});}catch(e){}
+      }
       if(caps.zoom && typeof caps.zoom.min==='number'){
         try{await track.applyConstraints({advanced:[{zoom:caps.zoom.min}]});}catch(e){}
       }
-    }catch(e){ console.warn('Camera selection fallback:',e); }
-
-    const video=document.getElementById('scannerVideo');
-    video.srcObject=scannerStream;
-    await video.play();
-    scannerSetStatus('وجّه الباركود داخل الإطار…');
-    clearInterval(scannerTimer);
-
-    // استخدم BarcodeDetector عندما يكون متاحًا، وإلا استخدم ZXing المتوافق مع Safari/iOS.
-    if('BarcodeDetector' in window){
-      const supported=await BarcodeDetector.getSupportedFormats();
-      const wanted=['ean_13','ean_8','upc_a','upc_e','code_128','code_39','itf'];
-      const formats=wanted.filter(x=>supported.includes(x));
-      if(!formats.length) throw new Error('NO_BARCODE_FORMATS');
-      const detector=new BarcodeDetector({formats});
-      let lastRaw='',hits=0;
-      scannerTimer=setInterval(async()=>{
-        if(!scannerStream || video.readyState<2)return;
-        try{
-          const codes=await detector.detect(video);
-          const raw=String(codes?.[0]?.rawValue??'').trim();
-          if(!raw)return;
-          if(raw===lastRaw)hits++;else{lastRaw=raw;hits=1;}
-          scannerSetStatus('تمت قراءة: '+raw);
-          if(hits>=2){putScannedBarcode(raw);closeScanner();}
-        }catch(e){}
-      },180);
-      return;
+    }catch(e){
+      console.warn('Camera selection fallback:',e);
     }
 
-    const loaded=await loadZXingBrowser();
-    if(!loaded) throw new Error('ZXING_LOAD_FAILED');
-    const Reader=window.ZXingBrowser.BrowserMultiFormatReader;
-    if(!Reader) throw new Error('ZXING_UNAVAILABLE');
-    const reader=new Reader();
-    scannerSetStatus('جاري التعرف على الباركود…');
-    let finished=false;
-    reader.decodeFromVideoElement(video,(result,err)=>{
-      if(finished || !result)return;
-      const raw=String(result.getText?.()??result.text??'').trim();
-      if(!raw)return;
-      finished=true;
-      scannerSetStatus('تمت قراءة: '+raw);
-      putScannedBarcode(raw);
-      try{reader.reset();}catch(e){}
-      closeScanner();
-    });
-    scannerTimer={zxingReader:reader};
+    const video=document.getElementById('scannerVideo');
+    video.setAttribute('playsinline','');
+    video.setAttribute('autoplay','');
+    video.muted=true;
+    video.srcObject=scannerStream;
+    await video.play();
+
+    scannerSetStatus('وجّه الباركود داخل الإطار…');
+    clearInterval(scannerTimer);
+    scannerTimer=null;
+
+    // نحاول BarcodeDetector أولًا إذا كان فعلاً يدعم أحد صيغ الباركود.
+    // Safari قد يعرّف BarcodeDetector لكن لا يدعم الصيغ المطلوبة؛ في هذه الحالة
+    // يجب الانتقال تلقائيًا إلى ZXing بدل إظهار "تعذر قراءة الباركود".
+    let nativeStarted=false;
+    try{
+      if('BarcodeDetector' in window && typeof BarcodeDetector.getSupportedFormats==='function'){
+        const supported=await BarcodeDetector.getSupportedFormats();
+        const wanted=['ean_13','ean_8','upc_a','upc_e','code_128','code_39','itf','codabar','qr_code'];
+        const formats=wanted.filter(x=>supported.includes(x));
+
+        if(formats.length){
+          const detector=new BarcodeDetector({formats});
+          let lastRaw='',hits=0,busy=false;
+
+          scannerTimer=setInterval(async()=>{
+            if(busy || !scannerStream || video.readyState<2)return;
+            busy=true;
+            try{
+              const codes=await detector.detect(video);
+              const raw=String(codes?.[0]?.rawValue ?? '').trim();
+              if(raw){
+                if(raw===lastRaw) hits++; else {lastRaw=raw;hits=1;}
+                scannerSetStatus('تمت قراءة: '+raw);
+                if(hits>=2){
+                  putScannedBarcode(raw);
+                  closeScanner();
+                }
+              }
+            }catch(e){
+              console.warn('BarcodeDetector scan failed, switching to ZXing:',e);
+              clearInterval(scannerTimer);
+              scannerTimer=null;
+              if(scannerStream){
+                try{await startZXing(video);}catch(ex){console.error(ex);}
+              }
+            }finally{
+              busy=false;
+            }
+          },250);
+          nativeStarted=true;
+        }
+      }
+    }catch(e){
+      console.warn('Native BarcodeDetector unavailable:',e);
+    }
+
+    if(!nativeStarted){
+      await startZXing(video);
+    }
+
   }catch(e){
     console.error('Scanner failed:',e);
+    stopReader();
     closeScanner();
-    alert('تعذر قراءة الباركود. تأكد من السماح للمتصفح بالكاميرا وأن الصفحة تعمل عبر HTTPS.');
+    alert('تعذر تشغيل قارئ الباركود. تأكد من السماح للمتصفح بالكاميرا وأن الصفحة تعمل عبر HTTPS.');
   }
 }
 
