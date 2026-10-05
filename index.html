@@ -644,6 +644,7 @@ async function cloudLogin(){
     if(alamanaRefreshToken) localStorage.setItem('alamana_cloud_refresh_token',alamanaRefreshToken);
     setCloudStatus('Cloud: متصل — الحفظ محلي والرفع يدوي ☁️',true);
     loadCloudQueue();
+    startAutomaticCloudSync();
     alert('✅ تم تسجيل الدخول إلى Alamana Cloud\n\n💾 التعديلات تُحفظ محليًا أولًا. رفعها إلى Cloud يتم يدويًا عند اختيارك.');
   }catch(e){
     alamanaAccessToken='';
@@ -670,6 +671,7 @@ async function refreshAlamanaSession(){
     localStorage.setItem('alamana_cloud_access_token',alamanaAccessToken);
     localStorage.setItem('alamana_cloud_refresh_token',alamanaRefreshToken);
     setCloudStatus('Cloud: تم تجديد تسجيل الدخول تلقائيًا ✅',true);
+    updateCloudRealtimeAuth();
     return true;
   }catch(e){ return false; }
 }
@@ -915,11 +917,148 @@ async function pollCloudChanges(){
 function scheduleCloudPoll(){
   // لا يوجد تنزيل تلقائي من Cloud؛ يتم ذلك فقط عند الضغط على 🔄.
 }
-function startAutomaticCloudSync(){
+// Supabase Realtime notifications are hints; read the committed row and variants before applying.
+let cloudRealtimeSocket=null,cloudRealtimeRetryTimer=null,cloudRealtimeHeartbeat=null,cloudRealtimeRef=0,cloudRealtimeJoinRef='';
+let cloudRealtimeJoined=false,cloudRealtimeStopped=false;
+const cloudRealtimeRefreshes=new Map();
+let cloudRealtimeVariantReconcileBusy=false,cloudRealtimeVariantReconcileAgain=false;
+function cloudRealtimeSend(event,payload={},topic='realtime:asnafy'){
+  if(!cloudRealtimeSocket||cloudRealtimeSocket.readyState!==WebSocket.OPEN)return false;
+  const ref=String(++cloudRealtimeRef);
+  if(event==='phx_join'&&topic==='realtime:asnafy')cloudRealtimeJoinRef=ref;
+  const msg={topic,event,payload,ref};
+  if(topic!=='phoenix')msg.join_ref=cloudRealtimeJoinRef||ref;
+  cloudRealtimeSocket.send(JSON.stringify(msg));
+  return true;
+}
+function cloudRealtimeScheduleReconnect(){
+  if(cloudRealtimeStopped||cloudRealtimeRetryTimer||!alamanaAccessToken)return;
+  cloudRealtimeRetryTimer=setTimeout(()=>{cloudRealtimeRetryTimer=null;startCloudRealtime()},5000);
+}
+function startCloudRealtime(){
+  if(cloudRealtimeStopped||!alamanaAccessToken||typeof WebSocket==='undefined')return;
+  if(cloudRealtimeSocket&&(cloudRealtimeSocket.readyState===WebSocket.OPEN||cloudRealtimeSocket.readyState===WebSocket.CONNECTING))return;
+  const wsUrl=ALAMANA_SUPABASE_URL.replace(/^https:/,'wss:').replace(/^http:/,'ws:')+
+    '/realtime/v1/websocket?apikey='+encodeURIComponent(ALAMANA_SUPABASE_KEY)+'&vsn=1.0.0';
+  try{
+    const socket=new WebSocket(wsUrl);cloudRealtimeSocket=socket;cloudRealtimeJoined=false;
+    socket.onopen=()=>{
+      if(socket!==cloudRealtimeSocket)return;
+      cloudRealtimeSend('phx_join',{config:{broadcast:{ack:false,self:false},presence:{enabled:false,key:''},private:false,postgres_changes:[
+        {event:'*',schema:'public',table:'products'},
+        {event:'*',schema:'public',table:'product_variants'}
+      ]},access_token:alamanaAccessToken});
+      if(cloudRealtimeHeartbeat)clearInterval(cloudRealtimeHeartbeat);
+      cloudRealtimeHeartbeat=setInterval(()=>cloudRealtimeSend('heartbeat',{},'phoenix'),25000);
+    };
+    socket.onmessage=(message)=>{
+      if(socket!==cloudRealtimeSocket)return;
+      let msg;try{msg=JSON.parse(message.data)}catch(e){return}
+      if(msg.event==='phx_reply'&&msg.payload?.status==='ok'&&msg.topic==='realtime:asnafy'){
+        cloudRealtimeJoined=true;setCloudStatus('Cloud: متصل — مزامنة مباشرة بين الأجهزة ✅',true);return;
+      }
+      if(msg.event==='phx_error'||msg.event==='phx_close'){cloudRealtimeJoined=false;return;}
+      if(msg.event!=='postgres_changes')return;
+      const change=msg.payload?.data||msg.payload||{},table=String(change.table||'');
+      const row=change.record||change.new||{},old=change.old_record||change.old||{};
+      const id=table==='products'?(row.id||old.id):(row.product_id||old.product_id);
+      if(id!==undefined&&id!==null)queueCloudRealtimeRefresh(String(id));
+      else if(table==='product_variants')queueCloudRealtimeVariantsReconcile();
+    };
+    socket.onerror=()=>{};
+    socket.onclose=()=>{
+      if(socket!==cloudRealtimeSocket)return;
+      cloudRealtimeJoined=false;
+      if(cloudRealtimeHeartbeat){clearInterval(cloudRealtimeHeartbeat);cloudRealtimeHeartbeat=null;}
+      cloudRealtimeScheduleReconnect();
+    };
+  }catch(e){cloudRealtimeScheduleReconnect();}
+}
+function updateCloudRealtimeAuth(){
+  if(cloudRealtimeJoined)cloudRealtimeSend('access_token',{access_token:alamanaAccessToken});
+  else startCloudRealtime();
+}
+function queueCloudRealtimeRefresh(productId){
+  // Serialize each row's refreshes so bursts and near-simultaneous writes converge to the latest commit.
+  const prior=cloudRealtimeRefreshes.get(productId)||Promise.resolve();
+  const next=prior.catch(()=>{}).then(()=>refreshCloudProductFromRealtime(productId)).catch(e=>{
+    console.error('Realtime product refresh failed',e);
+  });
+  cloudRealtimeRefreshes.set(productId,next);
+  next.finally(()=>{if(cloudRealtimeRefreshes.get(productId)===next)cloudRealtimeRefreshes.delete(productId)});
+}
+async function queueCloudRealtimeVariantsReconcile(){
+  if(cloudRealtimeVariantReconcileBusy){cloudRealtimeVariantReconcileAgain=true;return;}
+  cloudRealtimeVariantReconcileBusy=true;
+  try{
+    const pageSize=500,remoteProducts=[],remoteVariants=[];
+    for(let offset=0;;offset+=pageSize){
+      const r=await cloudFetch('/rest/v1/products?select=id,legacy_id,sku&limit='+pageSize+'&offset='+offset,{method:'GET'});
+      if(!r.ok)throw new Error('Realtime products index HTTP '+r.status);
+      const page=await r.json();remoteProducts.push(...page);if(page.length<pageSize)break;
+    }
+    for(let offset=0;;offset+=pageSize){
+      const r=await cloudFetch('/rest/v1/product_variants?select=product_id,name,barcode&limit='+pageSize+'&offset='+offset,{method:'GET'});
+      if(!r.ok)throw new Error('Realtime variants index HTTP '+r.status);
+      const page=await r.json();remoteVariants.push(...page);if(page.length<pageSize)break;
+    }
+    const cloudByKey=new Map(remoteProducts.map(p=>[productCloudKey(p),p])),variantsById=new Map();
+    remoteVariants.forEach(v=>{
+      const arr=variantsById.get(String(v.product_id))||[];
+      arr.push({name:String(v.name??''),barcode:String(v.barcode??'')});
+      variantsById.set(String(v.product_id),arr);
+    });
+    let changed=false;
+    for(const p of products){
+      const cp=cloudByKey.get(productCloudKey(p));if(!cp)continue;
+      const localId=String(p.id||'');if(cloudSyncPending.has(localId)||cloudSyncDeleted.has(localId))continue;
+      const variants=variantsById.get(String(cp.id))||[];
+      if(JSON.stringify(realVariants(p))!==JSON.stringify(variants)){p.variants=variants;changed=true;}
+    }
+    if(changed){save(false);render();setCloudStatus('Cloud: تم استقبال تحديث مباشر للـVariants ✅',true);}
+  }catch(e){console.error('Realtime variants reconciliation failed',e);}
+  finally{
+    cloudRealtimeVariantReconcileBusy=false;
+    if(cloudRealtimeVariantReconcileAgain){cloudRealtimeVariantReconcileAgain=false;queueCloudRealtimeVariantsReconcile();}
+  }
+}
+async function refreshCloudProductFromRealtime(productId){
   if(!alamanaAccessToken)return;
+  if(cloudSyncBusy){setTimeout(()=>queueCloudRealtimeRefresh(productId),1200);return;}
+  const r=await cloudFetch('/rest/v1/products?select=id,legacy_id,sku,name,category,barcode,price,cost,stock,updated_at,deleted_at&id=eq.'+
+    encodeURIComponent(productId)+'&limit=1',{method:'GET'});
+  if(!r.ok)throw new Error('Realtime product read HTTP '+r.status);
+  const rows=await r.json();if(!rows.length)return;
+  const cp=rows[0],key=productCloudKey(cp);
+  const localId=String(cp.sku??'').trim()?'SKU:'+String(cp.sku).trim():String(cp.legacy_id??cp.id??'');
+  // Preserve local edits until their queued upload has completed.
+  if(cloudSyncPending.has(localId)||cloudSyncDeleted.has(localId))return;
+  const idx=products.findIndex(p=>productCloudKey(p)===key||String(p.id)===String(cp.legacy_id||''));
+  let incoming=null;
+  if(!cp.deleted_at){
+    const vr=await cloudFetch('/rest/v1/product_variants?select=product_id,name,barcode&product_id=eq.'+
+      encodeURIComponent(cp.id),{method:'GET'});
+    if(!vr.ok)throw new Error('Realtime variants read HTTP '+vr.status);
+    incoming=normalize({id:localId,sku:cp.sku,name:cp.name,category:cp.category,barcode:cp.barcode,
+      price:cp.price,cost:cp.cost,stock:cp.stock,variants:(await vr.json()).map(v=>({
+        name:String(v.name??''),barcode:String(v.barcode??'')
+      }))});
+  }
+  if(incoming){
+    if(idx>=0&&JSON.stringify(normalize(products[idx]))===JSON.stringify(incoming))return;
+    if(idx>=0)products[idx]=incoming;else products.push(incoming);
+  }else{if(idx<0)return;products.splice(idx,1);}
+  save(false);render();setCloudStatus('Cloud: تم استقبال تحديث مباشر ✅',true);
+}
+function startAutomaticCloudSync(){
+  if(!alamanaAccessToken){
+    if(alamanaRefreshToken)refreshAlamanaSession().then(ok=>{if(ok)startAutomaticCloudSync()});
+    return;
+  }
   loadCloudQueue();
   scheduleCloudPoll();
   scheduleCloudSync();
+  startCloudRealtime();
 }
 
 
@@ -1256,6 +1395,7 @@ window.addEventListener('load',()=>{
   if(alamanaAccessToken||alamanaRefreshToken){
     setCloudStatus('Cloud: متصل — الحفظ محلي والرفع يدوي ☁️',true);
     loadCloudQueue();
+    startAutomaticCloudSync();
   }
 });
 
@@ -2483,6 +2623,65 @@ window.addEventListener('pagehide',closeScanner);
 
 setTimeout(renderQuality,250);
 setTimeout(renderQuality,1000);
+</script>
+
+
+<script id="ASNAFY-GLOBAL-BARCODE-SCANNER">
+(function(){
+  let buffer='', firstAt=0, lastAt=0, timer=null;
+  const MIN_LEN=6, MAX_GAP=90;
+
+  function reset(){
+    buffer=''; firstAt=0; lastAt=0;
+    if(timer){clearTimeout(timer);timer=null;}
+  }
+
+  function putBarcode(value){
+    value=String(value||'').trim();
+    if(!/^\d{6,18}$/.test(value)) return false;
+    const q=document.getElementById('q');
+    if(!q) return false;
+    q.value=value;
+    q.dispatchEvent(new Event('input',{bubbles:true}));
+    try{ if(typeof render==='function') render(); }catch(e){}
+    q.blur();
+    return true;
+  }
+
+  document.addEventListener('keydown',function(e){
+    if(e.ctrlKey||e.altKey||e.metaKey) return;
+    const now=performance.now();
+
+    if(e.key==='Enter'){
+      const value=buffer;
+      if(/^\d{6,18}$/.test(value) && firstAt && (now-firstAt)<3000){
+        if(putBarcode(value)){
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }
+      reset();
+      return;
+    }
+
+    if(!/^\d$/.test(e.key)) return;
+
+    if(lastAt && (now-lastAt)>MAX_GAP) reset();
+    if(!buffer) firstAt=now;
+    buffer += e.key;
+    lastAt=now;
+
+    if(timer) clearTimeout(timer);
+    timer=setTimeout(function(){
+      const value=buffer;
+      if(/^\d{6,18}$/.test(value) && firstAt &&
+         (performance.now()-firstAt)<3000){
+        putBarcode(value);
+      }
+      reset();
+    },140);
+  },true);
+})();
 </script>
 
 </body></html>
