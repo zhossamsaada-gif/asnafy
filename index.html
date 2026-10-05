@@ -498,6 +498,11 @@ body{
 /* The safe-area/header remains blue; content area stays light under the tiles. */
 </style>
 
+<style id="ASNAFY-SAVE-TOAST">
+#asnafySaveToast{position:fixed;z-index:10020;left:50%;bottom:24px;transform:translate(-50%,18px);max-width:calc(100vw - 32px);padding:11px 18px;border-radius:999px;background:#173f91;color:#fff;font:700 14px Tahoma,Arial,sans-serif;box-shadow:0 6px 22px #0003;opacity:0;pointer-events:none;transition:opacity .2s ease,transform .2s ease;text-align:center;white-space:normal}
+#asnafySaveToast.show{opacity:1;transform:translate(-50%,0)}
+</style>
+
 </head>
 <body>
 <div class="app">
@@ -589,6 +594,15 @@ let alamanaRefreshToken=localStorage.getItem('alamana_cloud_refresh_token')||'';
 function setCloudStatus(text, ok=false){
   const el=document.getElementById('cloudStatus');
   if(el){ el.textContent=text; el.style.fontWeight='700'; el.style.color=ok?'#16803c':''; }
+}
+let asnafySaveToastTimer=null;
+function showSaveToast(message){
+  let el=document.getElementById('asnafySaveToast');
+  if(!el){el=document.createElement('div');el.id='asnafySaveToast';el.setAttribute('role','status');el.setAttribute('aria-live','polite');document.body.appendChild(el);}
+  el.textContent=message;
+  el.classList.add('show');
+  if(asnafySaveToastTimer)clearTimeout(asnafySaveToastTimer);
+  asnafySaveToastTimer=setTimeout(()=>el.classList.remove('show'),2200);
 }
 
 let lastSyncAt=localStorage.getItem('alamana_last_sync_at')||'';
@@ -739,6 +753,8 @@ async function downloadAllFromCloud(){
       price:p.price,cost:p.cost,stock:p.stock,variants:byProduct.get(String(p.id))||[]
     })).filter(p=>p.id);
     localStorage.setItem('alamana_cloud_initialized','1');
+    cloudLastSeenAt=maxCloudTimestamp(cloudProducts)||cloudLastSeenAt;
+    if(cloudLastSeenAt)localStorage.setItem('alamana_cloud_last_seen_at',cloudLastSeenAt);
     save(false);
     render();
     markLastSync();
@@ -920,7 +936,8 @@ function scheduleCloudPoll(){
 // Supabase Realtime notifications are hints; read the committed row and variants before applying.
 let cloudRealtimeSocket=null,cloudRealtimeRetryTimer=null,cloudRealtimeHeartbeat=null,cloudRealtimeRef=0,cloudRealtimeJoinRef='';
 let cloudRealtimeJoined=false,cloudRealtimeStopped=false;
-const cloudRealtimeRefreshes=new Map();
+let cloudRealtimeEverJoined=false,cloudRealtimeRefreshWorker=false,cloudRealtimeRefreshScheduled=false;
+const cloudRealtimeRefreshQueue=new Set();
 let cloudRealtimeVariantReconcileBusy=false,cloudRealtimeVariantReconcileAgain=false;
 function cloudRealtimeSend(event,payload={},topic='realtime:asnafy'){
   if(!cloudRealtimeSocket||cloudRealtimeSocket.readyState!==WebSocket.OPEN)return false;
@@ -955,7 +972,13 @@ function startCloudRealtime(){
       if(socket!==cloudRealtimeSocket)return;
       let msg;try{msg=JSON.parse(message.data)}catch(e){return}
       if(msg.event==='phx_reply'&&msg.payload?.status==='ok'&&msg.topic==='realtime:asnafy'){
-        cloudRealtimeJoined=true;setCloudStatus('Cloud: متصل — مزامنة مباشرة بين الأجهزة ✅',true);return;
+        cloudRealtimeJoined=true;cloudRealtimeEverJoined=true;
+        setCloudStatus('Cloud: متصل — مزامنة مباشرة بين الأجهزة ✅',true);
+        // On every fresh connection, fetch changes missed while this app was closed/offline.
+        if(cloudLastSeenAt)setTimeout(()=>{
+          if(!cloudSyncBusy&&!cloudSyncPending.size&&!cloudSyncDeleted.size)pollCloudChanges();
+        },800);
+        return;
       }
       if(msg.event==='phx_error'||msg.event==='phx_close'){cloudRealtimeJoined=false;return;}
       if(msg.event!=='postgres_changes')return;
@@ -979,13 +1002,32 @@ function updateCloudRealtimeAuth(){
   else startCloudRealtime();
 }
 function queueCloudRealtimeRefresh(productId){
-  // Serialize each row's refreshes so bursts and near-simultaneous writes converge to the latest commit.
-  const prior=cloudRealtimeRefreshes.get(productId)||Promise.resolve();
-  const next=prior.catch(()=>{}).then(()=>refreshCloudProductFromRealtime(productId)).catch(e=>{
-    console.error('Realtime product refresh failed',e);
-  });
-  cloudRealtimeRefreshes.set(productId,next);
-  next.finally(()=>{if(cloudRealtimeRefreshes.get(productId)===next)cloudRealtimeRefreshes.delete(productId)});
+  // Collect bursts briefly, then fetch each committed row in sequence to avoid flooding REST.
+  cloudRealtimeRefreshQueue.add(productId);
+  if(cloudRealtimeRefreshWorker||cloudRealtimeRefreshScheduled)return;
+  cloudRealtimeRefreshScheduled=true;
+  setTimeout(drainCloudRealtimeRefreshQueue,180);
+}
+async function drainCloudRealtimeRefreshQueue(){
+  cloudRealtimeRefreshScheduled=false;
+  if(cloudRealtimeRefreshWorker)return;
+  cloudRealtimeRefreshWorker=true;
+  try{
+    while(cloudRealtimeRefreshQueue.size){
+      const batch=[...cloudRealtimeRefreshQueue];
+      cloudRealtimeRefreshQueue.clear();
+      for(const productId of batch){
+        try{await refreshCloudProductFromRealtime(productId)}
+        catch(e){console.error('Realtime product refresh failed',e)}
+      }
+    }
+  }finally{
+    cloudRealtimeRefreshWorker=false;
+    if(cloudRealtimeRefreshQueue.size&&!cloudRealtimeRefreshScheduled){
+      cloudRealtimeRefreshScheduled=true;
+      setTimeout(drainCloudRealtimeRefreshQueue,180);
+    }
+  }
 }
 async function queueCloudRealtimeVariantsReconcile(){
   if(cloudRealtimeVariantReconcileBusy){cloudRealtimeVariantReconcileAgain=true;return;}
@@ -1483,24 +1525,11 @@ async function askCloudUpload(){
   loadCloudQueue();
   const count=cloudSyncPending.size+cloudSyncDeleted.size;
   if(!count)return;
-
-  const yes=confirm(
-    'تم حفظ التعديل محليًا بنجاح ✅\n\n'+
-    'يوجد '+count+' تغيير محلي لم يتم رفعه إلى Cloud.\n\n'+
-    'هل تريد حفظ التعديل على Cloud الآن؟\n\n'+
-    'موافق = رفع التغييرات المعلقة فقط ☁️\n'+
-    'إلغاء = الاحتفاظ بها محليًا ورفعها لاحقًا.'
-  );
-  if(!yes)return;
-
-  if(!alamanaAccessToken){
-    await cloudLogin();
-    if(!alamanaAccessToken)return;
-  }
+  // Local save is already complete. Upload silently when a Cloud session exists.
+  if(!alamanaAccessToken)return;
 
   try{
-    const ok=await runQueuedCloudSync();
-    if(ok) alert('✅ تم حفظ التغييرات على Cloud بنجاح.');
+    await runQueuedCloudSync();
   }catch(e){
     // runQueuedCloudSync already shows the detailed error and preserves the queue.
   }
@@ -1867,16 +1896,21 @@ function toggle(id){
 function editProduct(id,key,value){
   const p=products.find(x=>x.id===id); if(!p)return;
   p[key]=String(value??'').trim();
-  save(true,true); render();
+  if(save(true,true)){
+    const labels={price:'تم تغيير سعر الصنف',cost:'تم تغيير تكلفة الصنف',stock:'تم تعديل مخزون الصنف',name:'تم تعديل اسم الصنف',category:'تم تعديل تصنيف الصنف'};
+    showSaveToast((labels[key]||'تم حفظ التعديل')+' • '+String(p.name||''));
+  }
+  render();
 }
 function editDirectBarcode(id,value){
   const p=products.find(x=>x.id===id); if(!p)return;
   const b=String(value??'').trim();
-  if(b && barcodeExists(b,id,-2)){alert('⚠️ الباركود ده موجود بالفعل في صنف آخر.');render();return}
+  if(b && barcodeExists(b,id,-2)){showSaveToast('⚠️ الباركود ده موجود بالفعل في صنف آخر');render();return}
   p.barcode=b;
   // Remove any legacy barcode-only pseudo-variant.
   p.variants=(p.variants||[]).filter(isRealVariant);
-  save(true,true); render();
+  if(save(true,true))showSaveToast('تم تغيير باركود الصنف • '+String(p.name||''));
+  render();
 }
 
 function addV(id){
@@ -1884,21 +1918,23 @@ function addV(id){
   const sid=cssSafe(id);
   const n=document.getElementById('vn-'+sid)?.value.trim()||'';
   const b=document.getElementById('vb-'+sid)?.value.trim()||'';
-  if(!n&&!b){alert('اكتب اسم الـVariety أو الباركود');return}
+  if(!n&&!b){showSaveToast('اكتب اسم الـVariety أو الباركود');return}
   p.variants=p.variants||[];
-  if(b && barcodeExists(b,id,-1)){alert('⚠️ الباركود ده موجود بالفعل في صنف آخر.');return}
+  if(b && barcodeExists(b,id,-1)){showSaveToast('⚠️ الباركود ده موجود بالفعل في صنف آخر');return}
   p.variants.push({name:n,barcode:b});
-  save(true,true); render();
+  if(save(true,true))showSaveToast('تمت إضافة Variety للصنف • '+String(p.name||''));
+  render();
   setTimeout(()=>toggle(id),20);
 }
-function editV(id,j,k,v){const p=products.find(x=>x.id===id);if(!p||!p.variants[j])return;v=String(v??'').trim();if(k==='barcode'&&v&&barcodeExists(v,id,j)){alert('⚠️ الباركود ده موجود بالفعل في صنف آخر.');render();return}p.variants[j][k]=v;save(true,true);renderQuality()}
-function delV(id,j){const p=products.find(x=>x.id===id);if(p&&confirm('حذف هذا الـVariety؟')){p.variants.splice(j,1);save(true,true);render()}}
-function deleteProduct(id){if(confirm('حذف الصنف وكل الـVarieties الخاصة به؟')){products=products.filter(p=>p.id!==id);save(true,true);render()}}
+function editV(id,j,k,v){const p=products.find(x=>x.id===id);if(!p||!p.variants[j])return;v=String(v??'').trim();if(k==='barcode'&&v&&barcodeExists(v,id,j)){showSaveToast('⚠️ الباركود ده موجود بالفعل في صنف آخر');render();return}p.variants[j][k]=v;if(save(true,true))showSaveToast((k==='barcode'?'تم تغيير باركود الـVariety':'تم تعديل الـVariety')+' • '+String(p.name||''));renderQuality()}
+function delV(id,j){const p=products.find(x=>x.id===id);if(p&&confirm('حذف هذا الـVariety؟')){p.variants.splice(j,1);if(save(true,true))showSaveToast('تم حذف Variety • '+String(p.name||''));render()}}
+function deleteProduct(id){const p=products.find(x=>x.id===id);if(confirm('حذف الصنف وكل الـVarieties الخاصة به؟')){products=products.filter(x=>x.id!==id);if(save(true,true))showSaveToast('تم حذف الصنف • '+String(p?.name||''));render()}}
 function addProduct(){
   const n=prompt('اسم الصنف الجديد:'); if(!n)return;
   const id='NEW-'+Date.now();
   products.unshift({id,sku:'',name:n.trim(),category:'',barcode:'',price:'',wholesale_price:'',cost:'',stock:'',variants:[]});
-  save(true,true); document.getElementById('q').value=n.trim(); render();
+  if(save(true,true))showSaveToast('تم حفظ الصنف • '+n.trim());
+  document.getElementById('q').value=n.trim(); render();
 }
 function fullName(p,v){let x=(p.name||'').trim(), y=(v.name||'').trim();return y?x+' '+y:x}
 function rows(){
@@ -2562,7 +2598,8 @@ function putScannedBarcode(value){
     const p=products.find(x=>x.id===t.id);
     if(p && p.variants && p.variants[t.j]){
       p.variants[t.j].barcode=value;
-      save(true,true); render();
+      if(save(true,true))showSaveToast('تم تغيير باركود الـVariety • '+String(p.name||''));
+      render();
     }
   }else{
     const el=document.getElementById('vb-'+cssSafe(t.id));
